@@ -311,6 +311,111 @@ defmodule Goth.TokenTest do
     assert token.scope == nil
   end
 
+  test "fetch/1 with AWS workload identity" do
+    access_key_id = "ASIAXXXXXXXXXXXXXXXXXX"
+    secret_access_key = "oXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    token = "oXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+    metadata_region_bypass = Bypass.open()
+    metadata_credentials_bypass = Bypass.open()
+    sts_bypass = Bypass.open()
+    token_bypass = Bypass.open()
+
+    Bypass.expect(metadata_region_bypass, fn conn ->
+      assert conn.request_path == "/latest/meta-data/placement/availability-zone"
+      Plug.Conn.resp(conn, 200, "us-east-1a")
+    end)
+
+    Bypass.expect(metadata_credentials_bypass, fn conn ->
+      assert conn.request_path == "/latest/meta-data/iam/security-credentials/"
+      Plug.Conn.resp(conn, 200, "test-role")
+    end)
+
+    Bypass.expect(metadata_credentials_bypass, "GET", "/latest/meta-data/iam/security-credentials/test-role", fn conn ->
+      body = ~s|
+      {
+        "Code": "Success",
+        "LastUpdated": "2023-10-26T21:31:48Z",
+        "Type": "AWS-HMAC",
+        "AccessKeyId": "#{access_key_id}",
+        "SecretAccessKey": "#{secret_access_key}",
+        "Token": "#{token}",
+        "Expiration": "2023-10-27T00:01:01Z"
+      }
+      |
+      Plug.Conn.resp(conn, 200, body)
+    end)
+
+    Bypass.expect(token_bypass, fn conn ->
+      assert conn.request_path == "/v1/token"
+
+      req_body = conn |> Plug.Conn.read_body() |> elem(1)
+      params = URI.decode_query(req_body)
+      subject_token = params["subject_token"]
+      audience = params["audience"]
+
+      aws_conf =
+        ExAws.Config.new(:sts,
+          access_key_id: access_key_id,
+          secret_access_key: secret_access_key,
+          security_token: token,
+          region: "us-east-1"
+        )
+
+      regional_cred_verification_url =
+        "http://localhost:#{sts_bypass.port}/?Action=GetCallerIdentity&Version=2011-06-15"
+
+      {:ok, expected_headers} =
+        ExAws.Auth.headers(
+          :post,
+          regional_cred_verification_url,
+          :sts,
+          aws_conf,
+          [{"x-goog-cloud-target-resource", audience}],
+          ""
+        )
+
+      decoded_request = URI.decode(subject_token) |> Jason.decode!()
+      request_headers = for %{"key" => k, "value" => v} <- decoded_request["headers"], into: %{}, do: {k, v}
+
+      Enum.each(expected_headers, fn {key, value} ->
+        assert Map.get(request_headers, key) == value
+      end)
+
+      body = ~s|{"access_token":"dummy","expires_in":3599,"token_type":"Bearer"}|
+
+      Plug.Conn.resp(conn, 200, body)
+    end)
+
+    credentials =
+      File.read!("test/data/test-credentials-aws-workload-identity.json")
+      |> Jason.decode!()
+      |> Map.put("token_url", "http://localhost:#{token_bypass.port}/v1/token")
+      |> Map.update!("credential_source", fn source ->
+        source
+        |> Map.put(
+          "region_url",
+          "http://localhost:#{metadata_region_bypass.port}/latest/meta-data/placement/availability-zone"
+        )
+        |> Map.put(
+          "url",
+          "http://localhost:#{metadata_credentials_bypass.port}/latest/meta-data/iam/security-credentials"
+        )
+        |> Map.put(
+          "regional_cred_verification_url",
+          "http://localhost:#{sts_bypass.port}/?Action=GetCallerIdentity&Version=2011-06-15"
+        )
+      end)
+
+    config = %{
+      source: {:workload_identity, credentials}
+    }
+
+    {:ok, token} = Goth.Token.fetch(config)
+    assert token.token == "dummy"
+    assert token.scope == nil
+  end
+
   defp random_service_account_credentials do
     %{
       "private_key" => random_private_key(),
