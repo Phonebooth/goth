@@ -393,7 +393,7 @@ defmodule Goth.Token do
         "requested_token_type" => "urn:ietf:params:oauth:token-type:access_token",
         "scope" => List.first(@default_scopes),
         "subject_token_type" => subject_token_type,
-        "subject_token" => subject_token_from_credential_source(credential_source, config)
+        "subject_token" => subject_token_from_credential_source(credential_source, audience, config)
       })
 
     response = request(config.http_client, method: :post, url: token_url, headers: headers, body: body)
@@ -416,19 +416,38 @@ defmodule Goth.Token do
     {url, audience}
   end
 
-  defp subject_token_from_credential_source(%{"url" => url, "headers" => headers, "format" => format}, config) do
+  defp subject_token_from_credential_source(
+         %{"url" => url, "headers" => headers, "format" => format},
+         _audience,
+         config
+       ) do
     with {:ok, %{status: 200, body: body}} <-
            request(config.http_client, method: :get, url: url, headers: Enum.to_list(headers), body: "") do
       subject_token_from_binary(body, format)
     end
   end
 
-  defp subject_token_from_credential_source(%{"file" => file, "format" => format}, _config) do
+  defp subject_token_from_credential_source(
+         %{
+           "url" => url,
+           "environment_id" => "aws1",
+           "region_url" => region_url,
+           "regional_cred_verification_url" => regional_cred_url_template
+         },
+         audience,
+         config
+       ) do
+    with {:ok, token} <- Goth.AWS.aws_iam_subject_token(url, region_url, regional_cred_url_template, audience, config) do
+      token
+    end
+  end
+
+  defp subject_token_from_credential_source(%{"file" => file, "format" => format}, _audience, _config) do
     File.read!(file) |> subject_token_from_binary(format)
   end
 
   # the default file type if not specified is "text"
-  defp subject_token_from_credential_source(%{"file" => file}, _config) do
+  defp subject_token_from_credential_source(%{"file" => file}, _audience, _config) do
     File.read!(file)
   end
 
